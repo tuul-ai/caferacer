@@ -1,0 +1,119 @@
+{
+  "repo_id": "test2/modified_dataset",
+  "fps": 30,
+  "robot_type": "so100",
+  "codebase_version": "v3.0",
+  "total_episodes": 2,
+  "total_frames": 868,
+  "features": {
+    "action": {
+      "dtype": "float32",
+      "shape": [
+        6
+      ],
+      "names": [
+        "main_shoulder_pan",
+        "main_shoulder_lift",
+        "main_elbow_flex",
+        "main_wrist_flex",
+        "main_wrist_roll",
+        "main_gripper"
+      ]
+    },
+    "observation.state": {
+      "dtype": "float32",
+      "shape": [
+        6
+      ],
+      "names": [
+        "main_shoulder_pan",
+        "main_shoulder_lift",
+        "main_elbow_flex",
+        "main_wrist_flex",
+        "main_wrist_roll",
+        "main_gripper"
+      ]
+    },
+    "observation.images.laptop": {
+      "dtype": "video",
+      "shape": [
+        480,
+        640,
+        3
+      ],
+      "names": [
+        "height",
+        "width",
+        "channels"
+      ],
+      "info": {
+        "video.fps": 30.0,
+        "video.height": 480,
+        "video.width": 640,
+        "video.channels": 3,
+        "video.codec": "av1",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "has_audio": false
+      }
+    },
+    "observation.images.phone": {
+      "dtype": "video",
+      "shape": [
+        480,
+        640,
+        3
+      ],
+      "names": [
+        "height",
+        "width",
+        "channels"
+      ],
+      "info": {
+        "video.fps": 30.0,
+        "video.height": 480,
+        "video.width": 640,
+        "video.channels": 3,
+        "video.codec": "av1",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "has_audio": false
+      }
+    },
+    "timestamp": {
+      "dtype": "float32",
+      "shape": [
+        1
+      ],
+      "names": null
+    },
+    "frame_index": {
+      "dtype": "int64",
+      "shape": [
+        1
+      ],
+      "names": null
+    },
+    "episode_index": {
+      "dtype": "int64",
+      "shape": [
+        1
+      ],
+      "names": null
+    },
+    "index": {
+      "dtype": "int64",
+      "shape": [
+        1
+      ],
+      "names": null
+    },
+    "task_index": {
+      "dtype": "int64",
+      "shape": [
+        1
+      ],
+      "names": null
+    }
+  }
+}
