@@ -8,11 +8,151 @@ import cv2
 from tqdm.notebook import tqdm
 from typing import List, Optional, Dict, Union
 import os
-import subprocess
 import torch
-import inspect
 
-from lerobot.caferacer.scripts.image_utils import tensor_to_pil, display_images
+from rembg import remove
+from google import genai
+from google.genai import types
+import base64
+from io import BytesIO
+from lerobot.caferacer.scripts.image_utils import tensor_to_pil, reorder_tensor_dimensions
+from lerobot.caferacer.scripts.gemini_utils import parse_json
+
+GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_ID = "gemini-2.0-flash"  # Use Gemini 2.0 Flash for 3D capabilities
+PRO_MODEL_ID ='gemini-2.0-pro-exp-02-05'
+
+def get_object_mask(gsam, im, object):
+    msk = gsam.remote(im, object)
+    msk_np = np.array(msk['results'][-2][msk['results'][3].index(object)][0])
+    return Image.fromarray(msk_np)
+
+def get_top_empty_space(img) -> str:
+    prompt = """Identify at least 1 and no more than 3 regions of empty space on the table surface in this top-down image.
+    The regions should be suitable for placing small objects 
+    1. without significant overlap with existing objects.
+    2. such that when red robot moves to pick and place the lego brick in container the selected empty space should not lay in its trajectory to lego brick or to the container 
+     
+    Provide the center point of each region.
+    The answer should follow the json format: [{"point": [y, x], "label": "empty_space_1"}, ...].
+    The points are in [y, x] format normalized to 0-1000."""
+    response = client.models.generate_content(
+        model=MODEL_ID,
+        contents=[img, prompt],
+        config=types.GenerateContentConfig(temperature=0.1),
+    )
+    return response.text
+    
+def get_front_empty_space(img_0, img_1, top_view_points) -> str:
+    prompt = """For the following images, predict if the points referenced in the first image are in frame.
+    If they are, also predict their 2D coordinates.
+    Each entry in the response should be a single line and have the following keys:
+    If the point is out of frame: 'in_frame': false, 'label' : <label>.
+    If the point is in frame: 'in_frame': true, 'point': [y, x], 'label': <label>.
+    The points are in [y, x] format normalized to 0-1000. Use the same labels provided in the context."""
+    response = client.models.generate_content(
+        model=MODEL_ID,
+        contents=[img_0, prompt, top_view_points, img_1],
+        config=types.GenerateContentConfig(temperature=0.1),
+    )
+    return response.text
+
+def gemini_inpaint_image(contents):
+    response = client.models.generate_content(
+        model="gemini-2.0-flash-exp-image-generation",
+        contents=contents,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_modalities=['Text', 'Image']
+        )
+    )
+
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            image_data = base64.b64decode(part.inline_data.data)
+            edited_image = Image.open(BytesIO(image_data))
+            return edited_image
+    return None
+
+def paste_topimg_for_gemini_inpaint(source_image, image_patch, top_coordinates):
+    """
+    Pastes image_patch onto source_image, centered at the given (x, y) coordinates.
+
+    Args:
+        source_image: The base PIL Image.
+        image_patch: The PIL Image to paste.
+        top_coordinates: The top_coordinates of the center of where to paste.
+    """
+    x = (top_coordinates[1]/1000.0) * source_image.size[0]
+    y = (top_coordinates[0]/1000.0) * source_image.size[1]
+
+    width, height = image_patch.size
+    top_left_x = int(x - width / 2)
+    top_left_y = int(y - height / 2)
+    # Create a copy to avoid modifying the original image
+    new_image = source_image.copy()
+    new_image.paste(image_patch, (top_left_x, top_left_y))
+    return new_image
+
+def get_inpaint_object(gsam, obs, object):
+    top_view = tensor_to_pil(obs['observation.images.phone'])
+    front_view = tensor_to_pil(obs['observation.images.laptop'])
+
+    empty_space_top_raw = get_top_empty_space(top_view)
+    empty_space_top = parse_json(empty_space_top_raw)
+    
+    empty_space_front_raw = get_front_empty_space(top_view, front_view, empty_space_top_raw)
+    empty_space_front = parse_json(empty_space_front_raw)
+
+    in_frame_points = [p for p in empty_space_front if p.get('in_frame')]
+    front_coordinates = in_frame_points[0]['point']
+    for p in empty_space_top:  # Find matching label
+        if p['label'] == in_frame_points[0]['label']:
+            top_coordinates = p['point']
+            break
+
+    object_prompt_front = f"""This is front image of a robot. 
+    Can you add a {object} to location y={front_coordinates[0]}, x={front_coordinates[1]}.
+    The points [y, x] are in format normalized to 0-1000."""
+    contents=[object_prompt_front, front_view]
+    first_front_im = gemini_inpaint_image(contents)
+    front_im_msk = get_object_mask(gsam, first_front_im, object)
+
+    front_im_msk_rgb = front_im_msk.convert('RGB')
+    croped_front = extract_masked_region(first_front_im, front_im_msk_rgb)
+    top_wrap = create_top_view(croped_front)
+    top_pasted = paste_topimg_for_gemini_inpaint(top_view, top_wrap, top_coordinates)
+    
+    object_prompt_top = f"""This is top view of a robot. Can you align the {object} and make it realistic in the image and cleanup the distorion around it at location y={top_coordinates[0]}, x={top_coordinates[1]}. 
+    DO NOT change or edit the Red Robot Arm, Blue Container or lego brick. The points [y, x] are in format normalized to 0-1000."""
+    contents=[object_prompt_top, top_pasted]
+    first_top_im = gemini_inpaint_image(contents)
+    
+    top_im_msk = get_object_mask(gsam, first_top_im, object)
+
+    return first_top_im, first_front_im, top_im_msk, front_im_msk
+
+def create_inpainted_frame(obs, source_top_im, source_front_im, top_im_msk, front_im_msk):
+    top_view = tensor_to_pil(obs['observation.images.phone'])
+    front_view = tensor_to_pil(obs['observation.images.laptop'])
+
+    top_view_obj = paste_masked_region(source_top_im, top_view, top_im_msk)
+    top_msk = rembg_mask(top_view)
+    top_im = paste_masked_region(top_view, top_view_obj, top_msk)
+    # Get rid of alpha channel
+    top_im = top_im.convert('RGB')
+    top_np = np.array(top_im)
+
+    front_view_obj = paste_masked_region(source_front_im, front_view, front_im_msk)
+    front_msk = rembg_mask(front_view)
+    front_im = paste_masked_region(front_view, front_view_obj, front_msk)
+    front_im = front_im.convert('RGB')
+    front_np = np.array(front_im)
+
+    obs['observation.images.phone'] = reorder_tensor_dimensions(torch.from_numpy(top_np))
+    obs['observation.images.laptop'] = reorder_tensor_dimensions(torch.from_numpy(front_np))
+    return obs
 
 def create_inpaint_mask(
     im: Union[Image.Image, np.ndarray],
@@ -146,84 +286,100 @@ def create_outpaint_mask(
     
     return new_im, mask
 
-def apply_filled_region(
-    target_im: Image.Image,
-    filled_im: Image.Image,
-    direction: str,
-    blur_width: int = 8,    # Increased from 4 to 8
-    sigma: float = 3.0      # Increased from 1.0 to 2.0
+def create_top_view(
+    im: Union[Image.Image, np.ndarray],
+    rotation_angle: float = 180.0,
+    perspective_strength: float = 0.3
 ) -> Image.Image:
     """
-    Paste filled region with stronger Gaussian blur at boundary
+    Rotate image and apply perspective transform to simulate top view
     
     Args:
-        target_im: Image to modify
-        filled_im: Image with filled region
-        direction: 'left', 'right', 'top', or 'bottom'
-        blur_width: Width of blur region on each side of boundary
-        sigma: Strength of the Gaussian blur
+        im: Input image (PIL Image or numpy array)
+        rotation_angle: Rotation angle in degrees
+        perspective_strength: Strength of perspective transform (0 to 1)
+    
+    Returns:
+        Image.Image: Transformed image
     """
-    width, height = target_im.size
-    shift_x = width // 10
-    shift_y = height // 10
+    # Convert numpy array to PIL if needed
+    if isinstance(im, np.ndarray):
+        im = Image.fromarray(im)
     
-    # Do the basic paste first
-    result_im = target_im.copy()
+    # Get image dimensions
+    width, height = im.size
     
-    if direction == 'left':
-        filled_region = filled_im.crop((0, 0, shift_x, height))
-        result_im.paste(filled_region, (0, 0))
-        
-        # Apply stronger Gaussian blur at boundary
-        arr = np.array(result_im)
-        boundary_region = arr[:, shift_x-blur_width:shift_x+blur_width]
-        arr[:, shift_x-blur_width:shift_x+blur_width] = cv2.GaussianBlur(
-            boundary_region, 
-            (blur_width*2-1, blur_width*2-1),  # Kernel size must be odd
-            sigma
-        )
-        result_im = Image.fromarray(arr)
-        
-    elif direction == 'right':
-        filled_region = filled_im.crop((width-shift_x, 0, width, height))
-        result_im.paste(filled_region, (width-shift_x, 0))
-        
-        arr = np.array(result_im)
-        boundary_region = arr[:, (width-shift_x-blur_width):(width-shift_x+blur_width)]
-        arr[:, (width-shift_x-blur_width):(width-shift_x+blur_width)] = cv2.GaussianBlur(
-            boundary_region,
-            (blur_width*2-1, blur_width*2-1),
-            sigma
-        )
-        result_im = Image.fromarray(arr)
-        
-    elif direction == 'top':
-        filled_region = filled_im.crop((0, 0, width, shift_y))
-        result_im.paste(filled_region, (0, 0))
-        
-        arr = np.array(result_im)
-        boundary_region = arr[shift_y-blur_width:shift_y+blur_width, :]
-        arr[shift_y-blur_width:shift_y+blur_width, :] = cv2.GaussianBlur(
-            boundary_region,
-            (blur_width*2-1, blur_width*2-1),
-            sigma
-        )
-        result_im = Image.fromarray(arr)
-        
-    elif direction == 'bottom':
-        filled_region = filled_im.crop((0, height-shift_y, width, height))
-        result_im.paste(filled_region, (0, height-shift_y))
-        
-        arr = np.array(result_im)
-        boundary_region = arr[(height-shift_y-blur_width):(height-shift_y+blur_width), :]
-        arr[(height-shift_y-blur_width):(height-shift_y+blur_width), :] = cv2.GaussianBlur(
-            boundary_region,
-            (blur_width*2-1, blur_width*2-1),
-            sigma
-        )
-        result_im = Image.fromarray(arr)
+    # First rotate the image
+    rotated_im = im.rotate(rotation_angle, expand=True, resample=Image.BICUBIC)
+    
+    # Calculate perspective transform points
+    # Source points (corners of original image)
+    src_points = np.float32([
+        [0, 0],  # top-left
+        [width, 0],  # top-right
+        [width, height],  # bottom-right
+        [0, height]  # bottom-left
+    ])
+    
+    # Calculate destination points for perspective transform
+    perspective_shift = int(height * perspective_strength)
+    dst_points = np.float32([
+        [perspective_shift, perspective_shift],  # top-left moved down and right
+        [width - perspective_shift, perspective_shift],  # top-right moved down and left
+        [width, height],  # bottom-right stays
+        [0, height]  # bottom-left stays
+    ])
+    
+    # Calculate perspective transform matrix
+    matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+    
+    # Apply perspective transform
+    rotated_arr = np.array(rotated_im)
+    result_arr = cv2.warpPerspective(
+        rotated_arr,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_LINEAR
+    )
+    
+    # Convert back to PIL Image
+    result_im = Image.fromarray(result_arr)
     
     return result_im
+
+def extract_masked_region(
+    im: Union[Image.Image, np.ndarray],
+    mask: Image.Image
+) -> Image.Image:
+    """
+    Extract/crop the region from image where mask is white
+    
+    Args:
+        im: Input image (PIL Image or numpy array)
+        mask: Mask image (white pixels indicate region to extract)
+    
+    Returns:
+        Image.Image: Cropped region from original image
+    """
+    # Convert numpy array to PIL if needed
+    if isinstance(im, np.ndarray):
+        im = Image.fromarray(im)
+    
+    # Convert mask to numpy array
+    mask_arr = np.array(mask)
+    
+    # Find white pixels (assuming RGB mask where white is [255,255,255])
+    white_pixels = np.all(mask_arr == 255, axis=2)
+    white_coords = np.where(white_pixels)
+    
+    # Get bounding box of white region
+    min_y, max_y = white_coords[0].min(), white_coords[0].max()
+    min_x, max_x = white_coords[1].min(), white_coords[1].max()
+    
+    # Crop original image to this region
+    cropped_region = im.crop((min_x, min_y, max_x + 1, max_y + 1))
+    
+    return cropped_region
 
 def paste_wrapped_image(
     target_im: Image.Image,
@@ -326,41 +482,7 @@ def paste_wrapped_image(
     
     return result_im, new_mask
 
-def extract_masked_region(
-    im: Union[Image.Image, np.ndarray],
-    mask: Image.Image
-) -> Image.Image:
-    """
-    Extract/crop the region from image where mask is white
-    
-    Args:
-        im: Input image (PIL Image or numpy array)
-        mask: Mask image (white pixels indicate region to extract)
-    
-    Returns:
-        Image.Image: Cropped region from original image
-    """
-    # Convert numpy array to PIL if needed
-    if isinstance(im, np.ndarray):
-        im = Image.fromarray(im)
-    
-    # Convert mask to numpy array
-    mask_arr = np.array(mask)
-    
-    # Find white pixels (assuming RGB mask where white is [255,255,255])
-    white_pixels = np.all(mask_arr == 255, axis=2)
-    white_coords = np.where(white_pixels)
-    
-    # Get bounding box of white region
-    min_y, max_y = white_coords[0].min(), white_coords[0].max()
-    min_x, max_x = white_coords[1].min(), white_coords[1].max()
-    
-    # Crop original image to this region
-    cropped_region = im.crop((min_x, min_y, max_x + 1, max_y + 1))
-    
-    return cropped_region
-
-def paste_masked_region(
+def paste_masked_region_old(
     target_im: Image.Image,
     original_im: Image.Image, 
     mask: Image.Image
@@ -405,3 +527,40 @@ def paste_masked_region(
     
     return result_im
 
+def paste_masked_region(source_img: Image.Image, target_img: Image.Image, mask: Image.Image) -> Image.Image:
+    """
+    Extract the masked region from image_0 and paste it on image_1 using given mask.
+    
+    Args:
+        image_0: Source image.
+        image_1: Target image.
+        mask: Mask image (grayscale, white indicates region to extract).
+        
+    Returns:
+        Image.Image: image_1 with masked region from image_0 pasted.
+    """
+    
+    # Ensure images are in RGBA format to handle transparency
+    source_img = source_img.convert("RGBA").resize(target_img.size)
+    target_img = target_img.convert("RGBA")
+    mask = mask.convert("L").resize(target_img.size)  # Ensure mask is grayscale
+
+    # Create a copy of image_1 to modify
+    new_target_img = target_img.copy()
+
+    # Extract the masked region from image_0
+    masked_region = Image.composite(source_img, Image.new('RGBA', source_img.size, (0,0,0,0)), mask)
+
+    # Paste the masked region onto image_1
+    new_target_img.paste(masked_region, (0, 0), mask)
+
+    return new_target_img
+
+def rembg_mask(im: Image.Image) -> Image.Image:
+    obj = remove(im)
+    obj_msk = Image.new("L", im.size)
+    obj_msk.paste(obj, (0, 0), obj)
+
+    msk = obj_msk.point(lambda x: 0 if x else 255, "1").convert('L')
+    negative_msk = msk.point(lambda x: 255 - x, "1").convert('L')
+    return negative_msk
