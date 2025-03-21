@@ -50,8 +50,8 @@ Coordinates the entire process:
 
 The main workflow is implemented in Jupyter notebooks in the `lerobot/caferacer` directory:
 
-1. `01_explore_data.ipynb`: Analyzes training and evaluation data, generates augmentation recommendations
-2. `augment_dataset.ipynb`: Implements the augmentations and creates new training datasets
+1. `00_gemini_loop.ipynb`: Analyzes training and evaluation data, generates augmentation recommendations
+2. `01_augment_dataset.ipynb`: Implements the augmentations and creates new training datasets
 
 For GPU-limited environments, use the `GPU_POOR=True` flag to optimize API calls.
 
