@@ -46,23 +46,9 @@ Coordinates the entire process:
 
 ## Getting Started
 
-### Prerequisites
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/self-learning-robotics.git
-cd self-learning-robotics
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Set up environment variables
-export GOOGLE_API_KEY="your_gemini_api_key"
-```
-
 ### Basic Usage
 
-The main workflow is implemented in Jupyter notebooks:
+The main workflow is implemented in Jupyter notebooks in the `lerobot/caferacer` directory:
 
 1. `01_explore_data.ipynb`: Analyzes training and evaluation data, generates augmentation recommendations
 2. `augment_dataset.ipynb`: Implements the augmentations and creates new training datasets
